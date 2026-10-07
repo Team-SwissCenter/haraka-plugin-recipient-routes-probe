@@ -1,6 +1,7 @@
 'use strict'
 
-const urlparser = require('url')
+const { domainToASCII } = require('node:url')
+
 const cache_key_prefix = 'probe:'
 
 exports.register = function () {
@@ -48,73 +49,82 @@ exports.load_config = function () {
         plugin.cfg.cache = {}
         plugin.cfg.cache.enabled = true
     }
-    plugin.cfg.cache.ttl = this.cfg.cache.ttl || 86400
+    plugin.cfg.cache.ttl = parseInt(plugin.cfg.cache.ttl) || 86400
     plugin.logdebug(`cache.ttl: ${plugin.cfg.cache.ttl}`)
 
-    plugin.cfg.cache.negative_ttl = this.cfg.cache.negative_ttl || 300
+    plugin.cfg.cache.negative_ttl = parseInt(plugin.cfg.cache.negative_ttl) || 300
     plugin.logdebug(`cache.negative_ttl: ${plugin.cfg.cache.negative_ttl}`)
 
     // Set smtp options
-    if (!plugin.cfg.probe) {
-        plugin.cfg.probe = {}
-    }
-    plugin.cfg.probe = {}
-    plugin.cfg.probe.timeout = this.cfg.probe.timeout || 5
+    if (!plugin.cfg.probe) plugin.cfg.probe = {}
+    plugin.cfg.probe.timeout = parseFloat(plugin.cfg.probe.timeout) || 5
     plugin.logdebug(`probe.timeout: ${plugin.cfg.probe.timeout}`)
 
     plugin.merge_redis_ini()
+}
+
+// Recipient hosts arrive as lower-case A-labels (punycode), so key the
+// routes the same way. A Map keeps names like "constructor" from
+// resolving through Object.prototype.
+const normalize_domain = (domain) => {
+    const lowered = String(domain).trim().toLowerCase()
+    return domainToASCII(lowered) || lowered
 }
 
 exports.load_domains = function () {
     // Load target domains we handle with their MX
     const plugin = this
 
-    plugin.cfg.domains = plugin.config.get('recipient-routes-probe-domains.ini', {}, () => {
+    const domains = plugin.config.get('recipient-routes-probe-domains.ini', {}, () => {
         plugin.load_domains()
     })
 
-    const lowered = {}
-    if (plugin.cfg.domains.main) {
-        const keys = Object.keys(plugin.cfg.domains.main)
-        for (const key of keys) {
-            lowered[key.toLowerCase()] = plugin.cfg.domains.main[key]
-        }
-        plugin.domains_list = lowered
-        const domains_count = Object.keys(plugin.domains_list).length
-        plugin.logdebug(`Target domains count: ${domains_count}`)
+    const routes = new Map()
+    for (const [domain, route] of Object.entries(domains.main ?? {})) {
+        routes.set(normalize_domain(domain), route)
     }
+    plugin.domains_list = routes
+    plugin.logdebug(`Target domains count: ${routes.size}`)
 }
+
+// Haraka < 3.2 (address-rfc2821) has address() as a method,
+// Haraka >= 3.2 (@haraka/email-address) has it as a string property
+const address_of = (addr) => (typeof addr.address === 'function' ? addr.address() : addr.address)
 
 exports.get_rcpt_address = function (rcpt) {
     // return current recipient address
-    if (!rcpt.host) return [rcpt.address.toLowerCase()]
-    return [rcpt.address.toLowerCase(), rcpt.host.toLowerCase()]
+    const address = address_of(rcpt).toLowerCase()
+    if (!rcpt.host) return [address]
+    return [address, rcpt.host.toLowerCase()]
 }
 
 exports.parse_mx = function (entry) {
+    if (typeof entry !== 'string' || !entry.trim()) return false
+    entry = entry.trim()
+
     // a bare host[:port] entry (no scheme) defaults to SMTP, per README
-    if (typeof entry === 'string' && !/^[a-z]+:\/\//i.test(entry)) {
-        entry = `smtp://${entry}`
-    }
+    if (!/^[a-z]+:\/\//i.test(entry)) entry = `smtp://${entry}`
 
     // Parse entry for protocol, host and port
-    const uri = new urlparser.parse(entry)
+    let uri
+    try {
+        uri = new URL(entry)
+    } catch {
+        return false
+    }
+    // URL keeps the brackets around IPv6 literals, and does not lower-case
+    // the host of a non-special scheme such as smtp:
+    const exchange = uri.hostname.replace(/^\[(.*)\]$/, '$1').toLowerCase()
+    if (!exchange) return false
 
     // Target is SMTP
     if (uri.protocol === 'smtp:') {
-        return {
-            exchange: uri.hostname,
-            port: uri.port,
-        }
+        return { exchange, port: parseInt(uri.port) || 25 }
     }
 
     // target is LMTP
     if (uri.protocol === 'lmtp:') {
-        return {
-            exchange: uri.hostname,
-            port: uri.port,
-            using_lmtp: true,
-        }
+        return { exchange, port: parseInt(uri.port) || 24, using_lmtp: true }
     }
 
     // unable to parse target MX
@@ -123,7 +133,7 @@ exports.parse_mx = function (entry) {
 
 exports.check_domains_list = async function (domain) {
     // Check domains list, so we know if we handle this target domain
-    return !!this.domains_list[domain]
+    return this.domains_list.has(domain)
 }
 
 exports.redis_available = async function () {
@@ -158,7 +168,7 @@ exports.add_redis_cache_entry = async function (address, result, ttl) {
     try {
         return await this.db
             .multi()
-            .hSet(`${cache_key_prefix}:${address}`, result)
+            .hSet(`${cache_key_prefix}:${address}`, { code: result.code, msg: result.msg })
             .expire(`${cache_key_prefix}:${address}`, ttl)
             .exec()
     } catch (err) {
@@ -167,48 +177,73 @@ exports.add_redis_cache_entry = async function (address, result, ttl) {
     }
 }
 
-exports.probe_mx_for_recipient = async function (connection, cfg, address) {
+// Resolves { code, msg, cacheable }. Only the backend's answer to RCPT is a
+// verdict on the recipient; anything else (connection trouble, a rejected
+// sender) must not be cached against the recipient address.
+exports.probe_mx_for_recipient = function (connection, cfg, address) {
     const plugin = this
 
-    // Probe target MX
-    try {
-        // Return SMTP probe result
-        return await new Promise((resolve, reject) => {
-            plugin.smtp_client_module.get_client_plugin(plugin, connection, cfg, (err, smtp_client) => {
-                // Catch any error
+    return new Promise((resolve) => {
+        let smtp_client
+        let settled = false
+
+        const done = (result) => {
+            if (settled) return
+            settled = true
+            clearTimeout(timer)
+            if (smtp_client) smtp_client.release()
+            resolve(result)
+        }
+        const transient = (msg) => done({ code: DENYSOFT, msg, cacheable: false })
+
+        // core's smtp_client only takes host and port from a plugin config
+        // and stays silent when the connection fails, so bound the probe here
+        const timer = setTimeout(() => {
+            connection.logerror(plugin, `SMTP probe to ${cfg.host}:${cfg.port} timed out after ${cfg.timeout}s`)
+            transient('Backend timeout')
+        }, cfg.timeout * 1000)
+
+        try {
+            plugin.smtp_client_module.get_client_plugin(plugin, connection, cfg, (err, client) => {
                 if (err) {
-                    connection.logerror(`SMTP Probe err: ${err}`, plugin)
-                    reject({ code: DENYSOFT, msg: 'Probe client err' })
-                    return
+                    connection.logerror(plugin, `SMTP Probe err: ${err}`)
+                    return transient('Probe client error')
                 }
+                smtp_client = client
 
-                smtp_client.on('rcpt', (code, msg) => {
-                    smtp_client.release()
-                    resolve({ code: OK, msg: 'Recipient accepted' })
+                client.socket.once('error', (e) => {
+                    connection.logerror(plugin, `SMTP probe to ${cfg.host}:${cfg.port} failed: ${e.message}`)
+                    transient('Backend unavailable')
                 })
 
-                smtp_client.on('mail', () => {
-                    // Send RCPT
-                    smtp_client.send_command('RCPT', `TO:${address}`, plugin)
+                client.on('mail', () => {
+                    client.send_command('RCPT', `TO:<${address}>`)
                 })
 
-                smtp_client.on('bad_code', (code, msg) => {
+                client.on('rcpt', () => {
+                    done({ code: OK, msg: 'Recipient accepted', cacheable: true })
+                })
+
+                client.on('bad_code', (code, msg) => {
                     // Remote SMTP is not happy
-                    smtp_client.release()
-                    resolve({ code: code && code[0] === '5' ? DENY : DENYSOFT, msg })
+                    done({
+                        code: code && code[0] === '5' ? DENY : DENYSOFT,
+                        msg,
+                        cacheable: client.command === 'rcpt',
+                    })
                 })
 
-                smtp_client.removeAllListeners('error')
-                smtp_client.on('error', (msg) => {
-                    connection.logerror(`SMTP Probe error: ${msg}`, plugin)
-                    resolve({ code: DENYSOFT, msg: `Probe client error` })
+                client.removeAllListeners('error')
+                client.on('error', (msg) => {
+                    connection.logerror(plugin, `SMTP Probe error: ${msg}`)
+                    transient('Probe client error')
                 })
             })
-        })
-    } catch (error) {
-        connection.logerror(`SMTP Probe exception: ${error}`, plugin)
-        return { code: DENYSOFT, msg: 'Probe client exception' }
-    }
+        } catch (err) {
+            connection.logerror(plugin, `SMTP Probe exception: ${err}`)
+            transient('Probe client exception')
+        }
+    })
 }
 
 exports.shutdown = function () {
@@ -216,6 +251,17 @@ exports.shutdown = function () {
 }
 
 exports.rcpt = async function (next, connection, params) {
+    // an exception escaping an async hook is an unhandled rejection,
+    // which takes the whole Haraka process down
+    try {
+        await this.check_rcpt(next, connection, params)
+    } catch (err) {
+        connection.logerror(this, `rcpt check failed: ${err.stack || err}`)
+        next(DENYSOFT, 'Backend error: recipient check failed')
+    }
+}
+
+exports.check_rcpt = async function (next, connection, params) {
     const txn = connection.transaction
     const plugin = this
 
@@ -239,12 +285,12 @@ exports.rcpt = async function (next, connection, params) {
     }
 
     // Try to parse target MX from domains list
-    const target_mx = plugin.parse_mx(plugin.domains_list[domain])
+    const route = plugin.domains_list.get(domain)
+    const target_mx = plugin.parse_mx(route)
 
     // MX Parsing failed
     if (!target_mx) {
-        // We don't know about this domain
-        plugin.logerror(`Not able to parse target MX (${plugin.domains_list[domain]} for domain ${domain}`, connection)
+        plugin.logerror(`Not able to parse target MX (${route}) for domain ${domain}`, connection)
         txn.results.add(plugin, { fail: 'mx.parsing' })
         return next(DENYSOFT, 'Backend error: Target MX parsing failed.')
     }
@@ -259,7 +305,7 @@ exports.rcpt = async function (next, connection, params) {
 
     // First, check redis cache (if available)
     if (!(await plugin.redis_available())) {
-        plugin.logwarn('Redis not available. Skipping cache check', connection)
+        if (plugin.cfg.cache.enabled) plugin.logwarn('Redis not available. Skipping cache check', connection)
     } else {
         const cached_results = await plugin.check_redis_cache(address)
         if (!cached_results) {
@@ -287,8 +333,7 @@ exports.rcpt = async function (next, connection, params) {
     const smtp_options = {
         host: target_mx.exchange,
         port: target_mx.port,
-        connect_timeout: plugin.cfg.probe.timeout,
-        idle_timeout: 5,
+        timeout: plugin.cfg.probe.timeout,
     }
 
     const smtp_result = await plugin.probe_mx_for_recipient(connection, smtp_options, address)
@@ -297,7 +342,9 @@ exports.rcpt = async function (next, connection, params) {
             `Recipient address ${address} refused by target MX ${target_mx.exchange}:${target_mx.port} ${smtp_result.code}/${smtp_result.msg}`,
             connection,
         )
-        plugin.add_redis_cache_entry(address, smtp_result, plugin.cfg.cache.negative_ttl)
+        if (smtp_result.cacheable) {
+            plugin.add_redis_cache_entry(address, smtp_result, plugin.cfg.cache.negative_ttl)
+        }
         txn.results.add(plugin, { fail: 'mx.deny' })
         next(smtp_result.code, smtp_result.msg)
     } else {
@@ -316,17 +363,21 @@ exports.rcpt = async function (next, connection, params) {
 exports.get_mx = function (next, hmail, domain) {
     // Get target MX for domain
     try {
-        const target_mx = this.parse_mx(this.domains_list[domain])
+        const route = this.domains_list.get(String(domain).toLowerCase())
 
-        if (target_mx) {
-            this.loginfo(
-                `[${hmail.todo.uuid}] Target MX found for domain ${domain} via ${target_mx.exchange}:${target_mx.port}`,
-            )
-            next(OK, `${target_mx.exchange}:${target_mx.port}`)
-        } else {
-            this.logerror(`[${hmail.todo.uuid}] No target MX found for domain ${domain}`)
-            next()
+        // not ours (e.g. a bounce to a remote sender): let DNS decide
+        if (!route) return next()
+
+        const target_mx = this.parse_mx(route)
+        if (!target_mx) {
+            this.logerror(`[${hmail.todo.uuid}] Not able to parse target MX (${route}) for domain ${domain}`)
+            return next()
         }
+
+        this.loginfo(
+            `[${hmail.todo.uuid}] Target MX found for domain ${domain} via ${target_mx.exchange}:${target_mx.port}`,
+        )
+        next(OK, { exchange: target_mx.exchange, port: target_mx.port, priority: 0 })
     } catch (err) {
         this.logerror(err)
         next()

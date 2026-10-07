@@ -52,7 +52,9 @@ The plugin is configured via two configuration files:
 ;password=changeme
 ;database=0
 
-; SMTP probe settings (default: 5 seconds)
+; SMTP probe settings: seconds before an unanswered probe defers the
+; recipient (default: 5). Keep it below the plugin timeout
+; (config/recipient-routes-probe.timeout, Haraka default 30).
 [probe]
 ;timeout=5
 
@@ -73,6 +75,10 @@ cooldomain.com=smtp://somemx.example.com:25
 greatdomain.com=othermx.example.com:25
 somedomain.com=mx.example.com:25
 ```
+
+Internationalized domains must be written as A-labels (`xn--bcher-kva.ch`, not
+`bücher.ch`): Haraka's ini parser drops lines with non-ASCII keys, and
+recipient domains reach the plugin as A-labels anyway.
 
 Only `smtp://` (and the no-scheme shorthand) are currently supported. LMTP
 targets parse but are rejected with `DENYSOFT "LMTP delivery not supported"`
