@@ -1,11 +1,11 @@
 'use strict'
 
-const urlparser = require("url");
-const cache_key_prefix = "probe:";
+const urlparser = require('url')
+const cache_key_prefix = 'probe:'
 
 exports.register = function () {
-    const plugin = this;
-    plugin.smtp_client_module = this.haraka_require("smtp_client.js");
+    const plugin = this
+    plugin.smtp_client_module = this.haraka_require('smtp_client.js')
 
     // We need the redis plugin
     plugin.inherits('haraka-plugin-redis')
@@ -92,6 +92,11 @@ exports.get_rcpt_address = function (rcpt) {
 }
 
 exports.parse_mx = function (entry) {
+    // a bare host[:port] entry (no scheme) defaults to SMTP, per README
+    if (typeof entry === 'string' && !/^[a-z]+:\/\//i.test(entry)) {
+        entry = `smtp://${entry}`
+    }
+
     // Parse entry for protocol, host and port
     const uri = new urlparser.parse(entry)
 
@@ -303,7 +308,7 @@ exports.rcpt = async function (next, connection, params) {
         plugin.add_redis_cache_entry(address, smtp_result, plugin.cfg.cache.ttl)
         connection.relaying = true // Allow relaying
         txn.results.add(plugin, { pass: 'mx.accept' })
-        txn.notes.set('queue.wants', 'outbound ') // We want to use outbound
+        txn.notes.set('queue.wants', 'outbound') // We want to use outbound
         next(smtp_result.code, smtp_result.msg)
     }
 }
@@ -316,11 +321,11 @@ exports.get_mx = function (next, hmail, domain) {
         if (target_mx) {
             this.loginfo(
                 `[${hmail.todo.uuid}] Target MX found for domain ${domain} via ${target_mx.exchange}:${target_mx.port}`,
-            );
-            next(OK, `${target_mx.exchange}:${target_mx.port}`);
+            )
+            next(OK, `${target_mx.exchange}:${target_mx.port}`)
         } else {
-            this.logerror(`[${hmail.todo.uuid}] No target MX found for domain ${domain}`);
-            next();
+            this.logerror(`[${hmail.todo.uuid}] No target MX found for domain ${domain}`)
+            next()
         }
     } catch (err) {
         this.logerror(err)

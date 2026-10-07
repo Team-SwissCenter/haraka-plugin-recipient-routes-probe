@@ -1,7 +1,6 @@
-[![CI Test Status][ci-img]][ci-url]
-[![Code Climate][clim-img]][clim-url]
-
 # haraka-plugin-recipient-routes-probe
+
+[![Test][ci-img]][ci-url] [![Cover][cov-img]][cov-url] [![Qlty][qlty-img]][qlty-url]
 
 Validate incoming mails recipients against defined target MX before accepting them.
 
@@ -69,12 +68,16 @@ The plugin is configured via two configuration files:
 ```ini
 ; Format is domain.tld=protocol://target_mx:target_port
 cooldomain.com=smtp://somemx.example.com:25
-nicedomain.com=lmtp://192.168.0.10:24
 
 ; If protocol is omitted, it defaults to smtp
-greatdomain.com=othermx.example.com:25s to smtp
+greatdomain.com=othermx.example.com:25
 somedomain.com=mx.example.com:25
 ```
+
+Only `smtp://` (and the no-scheme shorthand) are currently supported. LMTP
+targets parse but are rejected with `DENYSOFT "LMTP delivery not supported"`
+at delivery time; see the upstream `recipient-routes` plugin if you need
+LMTP routing.
 
 ## Redis caching
 
@@ -104,7 +107,9 @@ Written by Sébastien Riccio. Most of the code is outrageously inspired by Matt 
 
 <!-- leave these buried at the bottom of the document -->
 
-[ci-img]: https://github.com/sriccio/haraka-plugin-recipient-routes-probe/actions/workflows/ci.yml/badge.svg
-[ci-url]: https://github.com/sriccio/haraka-plugin-recipient-routes-probe/actions/workflows/ci.yml
-[clim-img]: https://codeclimate.com/github/sriccio/haraka-plugin-recipient-routes-probe/badges/gpa.svg
-[clim-url]: https://codeclimate.com/github/sriccio/haraka-plugin-recipient-routes-probe
+[ci-img]: https://github.com/Team-SwissCenter/haraka-plugin-recipient-routes-probe/actions/workflows/ci.yml/badge.svg
+[ci-url]: https://github.com/Team-SwissCenter/haraka-plugin-recipient-routes-probe/actions/workflows/ci.yml
+[cov-img]: https://codecov.io/github/Team-SwissCenter/haraka-plugin-recipient-routes-probe/coverage.svg
+[cov-url]: https://codecov.io/github/Team-SwissCenter/haraka-plugin-recipient-routes-probe
+[qlty-img]: https://qlty.sh/gh/Team-SwissCenter/projects/haraka-plugin-recipient-routes-probe/maintainability.svg
+[qlty-url]: https://qlty.sh/gh/Team-SwissCenter/projects/haraka-plugin-recipient-routes-probe
